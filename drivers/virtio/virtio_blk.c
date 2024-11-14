@@ -14,7 +14,11 @@
 #include <virtio_ring.h>
 #include "virtio_blk.h"
 
+#define VIRTIO_BLK_SIZE		512
+#define VIRTIO_BLK_SIZE_LOG2	9
+
 struct virtio_blk_priv {
+	lbaint_t lim_req_blks;
 	struct virtqueue *vq;
 };
 
@@ -32,7 +36,7 @@ static ulong virtio_blk_do_req(struct udevice *dev, u64 sector,
 		.sector = cpu_to_virtio64(dev, sector),
 	};
 	struct virtio_sg hdr_sg = { &out_hdr, sizeof(out_hdr) };
-	struct virtio_sg data_sg = { buffer, blkcnt * 512 };
+	struct virtio_sg data_sg = { buffer, blkcnt * VIRTIO_BLK_SIZE };
 	struct virtio_sg status_sg = { &status, sizeof(status) };
 
 	sgs[num_out++] = &hdr_sg;
@@ -60,19 +64,48 @@ static ulong virtio_blk_do_req(struct udevice *dev, u64 sector,
 	return status == VIRTIO_BLK_S_OK ? blkcnt : -EIO;
 }
 
+static ulong virtio_blk_do_lim_req(struct udevice *dev, u64 sector,
+				   lbaint_t blkcnt, void *buffer, u32 type)
+{
+	struct virtio_blk_priv *priv = dev_get_priv(dev);
+	lbaint_t nblks = blkcnt;
+	lbaint_t last_nblks = 0;
+	ulong total = 0;
+	ulong rcnt = 0;
+
+	if (priv->lim_req_blks && blkcnt > priv->lim_req_blks) {
+		nblks = priv->lim_req_blks;
+		last_nblks = blkcnt % priv->lim_req_blks;
+	}
+
+	while (blkcnt > total) {
+		rcnt = virtio_blk_do_req(dev, sector, nblks, buffer, type);
+		if ((long)rcnt < 0)
+			return rcnt;
+
+		total += rcnt;
+		sector += rcnt;
+		buffer += rcnt * VIRTIO_BLK_SIZE;
+		if (blkcnt - total == last_nblks)
+			nblks = last_nblks;
+	}
+
+	return total;
+}
+
 static ulong virtio_blk_read(struct udevice *dev, lbaint_t start,
 			     lbaint_t blkcnt, void *buffer)
 {
 	log_debug("read %s\n", dev->name);
-	return virtio_blk_do_req(dev, start, blkcnt, buffer,
-				 VIRTIO_BLK_T_IN);
+	return virtio_blk_do_lim_req(dev, start, blkcnt, buffer,
+				     VIRTIO_BLK_T_IN);
 }
 
 static ulong virtio_blk_write(struct udevice *dev, lbaint_t start,
 			      lbaint_t blkcnt, const void *buffer)
 {
-	return virtio_blk_do_req(dev, start, blkcnt, (void *)buffer,
-				 VIRTIO_BLK_T_OUT);
+	return virtio_blk_do_lim_req(dev, start, blkcnt, (void *)buffer,
+				     VIRTIO_BLK_T_OUT);
 }
 
 static int virtio_blk_bind(struct udevice *dev)
@@ -114,16 +147,22 @@ static int virtio_blk_probe(struct udevice *dev)
 	struct virtio_blk_priv *priv = dev_get_priv(dev);
 	struct blk_desc *desc = dev_get_uclass_plat(dev);
 	u64 cap;
+	u32 lim_seg_size;
+	u32 lim_segs;
 	int ret;
 
 	ret = virtio_find_vqs(dev, 1, &priv->vq);
 	if (ret)
 		return ret;
 
-	desc->blksz = 512;
-	desc->log2blksz = 9;
+	desc->blksz = VIRTIO_BLK_SIZE;
+	desc->log2blksz = VIRTIO_BLK_SIZE_LOG2;
 	virtio_cread(dev, struct virtio_blk_config, capacity, &cap);
 	desc->lba = cap;
+
+	virtio_cread(dev, struct virtio_blk_config, size_max, &lim_seg_size);
+	virtio_cread(dev, struct virtio_blk_config, seg_max, &lim_segs);
+	priv->lim_req_blks = (lim_seg_size * lim_segs) >> desc->log2blksz;
 
 	return 0;
 }
